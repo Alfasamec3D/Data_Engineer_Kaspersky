@@ -24,7 +24,8 @@ rootless-образ, зафиксированные зависимости, ло
 - **Воспроизводимость.** `scripts/lock.sh` (`uv pip compile --generate-hashes`) пишет все прямые и транзитивные
   зависимости с хэшами; `Dockerfile` ставит их через `pip install --require-hashes --no-deps`.
 - **Приватность логов.** `VLLM_LOGGING_CONFIG_PATH` подключает `logging.Filter` на handler логгера `vllm`.
-  Записи `vllm.entrypoints.logger` (там vLLM пишет промпт и ответ) заменяются на
+  Записи RequestLogger (там vLLM пишет промпт и ответ: `vllm.entrypoints.serve.utils.request_logger` в 0.27,
+  `vllm.entrypoints.logger` в более старых релизах) заменяются на
   `model request received: id=<request-id> (prompt/output not logged)`; в остальных записях значения после
   `prompt/output/...` заменяются на `[REDACTED]`. Дополнительно запуск идёт с `--max-log-len 0`.
   Факт обращения остаётся в логе (request id + строки access-лога uvicorn с путём и кодом ответа).
@@ -39,33 +40,34 @@ rootless-образ, зафиксированные зависимости, ло
 
 ## Запуск (Minikube)
 
-Требуется Docker, minikube, kubectl, uv; 12 ГиБ RAM и 4 vCPU для кластера
+Требуется Docker, minikube, kubectl, uv; минимум 12 ГиБ RAM и 4 vCPU для кластера
 (под запрашивает 2 CPU / 6 ГиБ, лимит памяти 10 ГиБ: веса в float32 занимают ~6 ГиБ).
+Больше vCPU (`--cpus`) ускоряет инференс; результаты ниже сняты на ноде с 18 vCPU.
 
 ```bash
 # 0. Зафиксировать зависимости (один раз, нужен интернет), результат закоммитить
 ./scripts/lock.sh
- 
+
 # 1. Кластер
 minikube start --cpus 4 --memory 12g
- 
+
 # 2. Собрать образы локальным Docker и загрузить их в minikube
 #    (работает при любом рантайме minikube, в том числе containerd, где docker-env не подходит)
 docker build -t vllm-cpu:0.27.1 .
 docker build -f downloader/Dockerfile -t vllm-model-downloader:1.0 .
 minikube image load vllm-cpu:0.27.1
 minikube image load vllm-model-downloader:1.0
- 
+
 # 3. Секреты (файл в .gitignore)
 cp k8s/secrets.env.example k8s/secrets.env
 sed -i.bak "s/^VLLM_API_KEY=.*/VLLM_API_KEY=$(openssl rand -hex 32)/" k8s/secrets.env && rm k8s/secrets.env.bak
 #   HF_TOKEN оставьте пустым для публичной модели; для gated/private впишите свой токен
- 
+
 # 4. Деплой
 kubectl apply -k k8s/
 kubectl -n vllm rollout status deploy/vllm --timeout=30m
 kubectl -n vllm logs deploy/vllm -c model-downloader   # первый запуск: скачивание; рестарт: "skipping network access"
- 
+
 # 5. Проверка
 kubectl -n vllm port-forward svc/vllm 8000:8000 &
 export API_KEY=$(grep ^VLLM_API_KEY k8s/secrets.env | cut -d= -f2)
@@ -73,11 +75,11 @@ curl -s localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"qwen2.5-1.5b-instruct","messages":[{"role":"user","content":"Привет!"}],"max_tokens":32}'
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/v1/models        # без токена -> 401
- 
+
 # 6. Проверка приватности логов: в выводе должен быть request id, но не текст «Привет!»
 kubectl -n vllm logs deploy/vllm | grep -i "model request"
 kubectl -n vllm logs deploy/vllm | grep -c "Привет" || true            # ожидаем 0
- 
+
 # 7. Проверка кэша: рестарт пода не должен снова качать веса
 kubectl -n vllm rollout restart deploy/vllm && kubectl -n vllm rollout status deploy/vllm
 kubectl -n vllm logs deploy/vllm -c model-downloader                   # "skipping network access"
@@ -155,7 +157,7 @@ runtime containerd, нода 18 vCPU / 12 ГиБ). vLLM 0.27.1+cpu, `float32`, `
 
 ## Ограничения и заметки
 
-- Образ рассчитан на x86_64 (колесо `manylinux_2_35_x86_64`). Для ARM замените колесо в `requirements.in` и
+- Образ рассчитан на x86_64 (колесо `manylinux_2_34_x86_64`). Для ARM замените колесо в `requirements.in` и
   `--python-platform` в `scripts/lock.sh`.
 - `readOnlyRootFilesystem` не включён: vLLM/torch пишут кэш компиляции; записываемые пути вынесены в `emptyDir`.
 - Реестр: образы собираются локально и загружаются в minikube через `minikube image load` (`imagePullPolicy: IfNotPresent`); для реального кластера
