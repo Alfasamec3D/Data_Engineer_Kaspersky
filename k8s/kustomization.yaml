@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: vllm
+resources:
+  - namespace.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+# The ConfigMap is generated from vllm-config.env: the content hash in its name makes
+# `kubectl apply -k` roll the pod whenever an inference parameter changes.
+configMapGenerator:
+  - name: vllm-config
+    envs:
+      - vllm-config.env
+
+# The Secret is generated from the local k8s/secrets.env (not committed, see secrets.env.example).
+# kustomize adds a hash suffix to the name and updates the references in the Deployment.
+secretGenerator:
+  - name: vllm-secrets
+    envs:
+      - secrets.env
+    type: Opaque
+
+images:                       # convenient for overriding images when pushing to a registry
+  - name: vllm-cpu
+    newTag: "0.27.1"
+  - name: vllm-model-downloader
+    newTag: "1.0"

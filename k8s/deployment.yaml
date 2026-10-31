@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 3600   # the first start downloads the model, which can take a long time
+  strategy:
+    type: Recreate            # the PVC is ReadWriteOnce: two pods cannot mount it at once
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      automountServiceAccountToken: false
+      # Do not inject <SERVICE>_* env vars: the Service is named "vllm", so Kubernetes would set
+      # VLLM_PORT=tcp://<ip>:8000, which collides with vLLM's own VLLM_PORT setting and crashes the engine.
+      enableServiceLinks: false
+      securityContext:        # pod-wide: rootless
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001        # makes the weights volume writable for uid 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Bonus 2: the weights are downloaded by a separate initContainer on a lightweight rootless image.
+      # If the weights are already in the PVC (.download_complete marker), the network is not used.
+      initContainers:
+        - name: model-downloader
+          image: vllm-model-downloader:1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: vllm-config
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vllm-secrets
+                  key: HF_TOKEN
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: loader-cache
+              mountPath: /home/loader/.cache
+
+      containers:
+        - name: vllm
+          image: vllm-cpu:0.27.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: vllm-config      # all inference parameters come from the ConfigMap
+          env:
+            - name: VLLM_API_KEY       # client bearer token comes from the Secret
+              valueFrom:
+                secretKeyRef:
+                  name: vllm-secrets
+                  key: VLLM_API_KEY
+            # HF_TOKEN is intentionally NOT passed to the main container: it runs offline
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            # fits a `minikube start --cpus 4 --memory 12g` node (system pods reserve part of it)
+            requests: { cpu: "2", memory: 6Gi }
+            limits: { memory: 10Gi }     # fp32 weights (~6 GiB) + KV cache (1 GiB) + /dev/shm + headroom
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+            - name: cache
+              mountPath: /home/vllm/.cache
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:               # weight loading and warm-up can take a long time on CPU
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 180     # 180 * 10s = up to 30 minutes before the pod is killed
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+            failureThreshold: 6
+
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: vllm-models
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }
+        - name: cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: loader-cache
+          emptyDir: {}

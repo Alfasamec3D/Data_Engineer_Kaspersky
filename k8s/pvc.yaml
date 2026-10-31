@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-models
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # storageClassName is not set -> the cluster's default StorageClass (Minikube: standard)
+  resources:
+    requests:
+      storage: 10Gi

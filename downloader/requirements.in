@@ -1,0 +1,2 @@
+# Top-level dependency of the model downloader. Full pin: ./scripts/lock.sh
+huggingface_hub
